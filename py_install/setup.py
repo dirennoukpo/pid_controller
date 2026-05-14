@@ -1,10 +1,10 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 setup(
-    name="Rosmaster_Lib",
-    version="3.3.9",
+    name='Rosmaster_Lib',
+    version='3.3.9',
+    author='Yahboom Team',
     packages=find_packages(),
-    install_requires=[],
 )
 
 # cd py_install

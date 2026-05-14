@@ -1,13 +1,28 @@
+import sys
+import signal
+import math
+import time
+import argparse
+
+try:
+    from Rosmaster_Lib import Rosmaster
+except ImportError:
+    print("[ERROR] Rosmaster_Lib not found")
+    sys.exit(1)
+
+
+# ──────────────────────────────────────────────
+# PID Controller
+# ──────────────────────────────────────────────
 class PIDController:
     def __init__(self, kp, ki, kd, output_limits=None, integral_limits=None):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.output_limits = output_limits        # (min, max) or None
-        self.integral_limits = integral_limits    # (min, max) or None — windup guard
-
-        self.integral = 0
-        self.previous_error = 0
+        self.kp              = kp
+        self.ki              = ki
+        self.kd              = kd
+        self.output_limits   = output_limits
+        self.integral_limits = integral_limits
+        self.integral        = 0.0
+        self.previous_error  = 0.0
 
     def update(self, set_point, current_value, dt):
         if dt <= 0:
@@ -15,18 +30,16 @@ class PIDController:
 
         error = set_point - current_value
 
-        # Integral with optional windup clamp
         self.integral += error * dt
         if self.integral_limits is not None:
             lo, hi = self.integral_limits
             self.integral = max(lo, min(hi, self.integral))
 
-        derivative = (error - self.previous_error) / dt
+        derivative          = (error - self.previous_error) / dt
         self.previous_error = error
 
         output = self.kp * error + self.ki * self.integral + self.kd * derivative
 
-        # Optional output clamp
         if self.output_limits is not None:
             lo, hi = self.output_limits
             output = max(lo, min(hi, output))
@@ -34,74 +47,165 @@ class PIDController:
         return output
 
     def reset(self):
-        self.integral = 0
-        self.previous_error = 0
+        self.integral       = 0.0
+        self.previous_error = 0.0
 
-import math
 
+# ──────────────────────────────────────────────
+# Yaw Filter
+# ──────────────────────────────────────────────
 class YawFilter:
-    """
-    Exponential low-pass filter for yaw angle (degrees, [-180, 180]).
-
-    Parameters
-    ----------
-    alpha : float, optional
-        Fixed smoothing factor in (0, 1]. Used when dt is not provided.
-        alpha=1.0 → no filtering. alpha→0 → very heavy filtering.
-    tau : float, optional
-        Time constant (seconds). When provided alongside dt in update(),
-        alpha is recomputed each step as 1 - exp(-dt / tau),
-        making the filter independent of sampling rate.
-    """
-
-    def __init__(self, alpha: float = 0.30, tau: float | None = None):
-        if not (0.0 < alpha <= 1.0):
-            raise ValueError(f"alpha must be in (0, 1], got {alpha}")
-        if tau is not None and tau <= 0.0:
+    def __init__(self, tau: float = 0.08):
+        if tau <= 0.0:
             raise ValueError(f"tau must be positive, got {tau}")
-
-        self._alpha = alpha
         self._tau   = tau
         self._y     = 0.0
         self._first = True
 
-    # ------------------------------------------------------------------
     @staticmethod
     def _norm(a: float) -> float:
-        """Wrap angle to [-180, 180] — O(1), no loop."""
+        """Wrap angle difference to [-180, 180]."""
         return (a + 180.0) % 360.0 - 180.0
 
-    # ------------------------------------------------------------------
-    def update(self, raw: float, dt: float | None = None) -> float:
-        """
-        Parameters
-        ----------
-        raw : float   New yaw measurement (degrees).
-        dt  : float   Time since last call (seconds). Required if tau was set.
-        """
+    def update(self, raw: float, dt: float) -> float:
         if self._first:
             self._y     = raw
             self._first = False
             return self._y
-
-        # Compute effective alpha
-        if self._tau is not None:
-            if dt is None or dt <= 0.0:
-                raise ValueError("dt must be a positive float when tau is set")
-            alpha = 1.0 - math.exp(-dt / self._tau)
-        else:
-            alpha = self._alpha
-
+        if dt <= 0.0:
+            raise ValueError(f"dt must be positive, got {dt}")
+        alpha    = 1.0 - math.exp(-dt / self._tau)
         self._y += alpha * self._norm(raw - self._y)
         return self._y
 
-    # ------------------------------------------------------------------
     def reset(self, value: float = 0.0) -> None:
-        """Reinitialise le filtre (ex: après une perte de signal)."""
         self._y     = value
         self._first = True
 
     @property
     def value(self) -> float:
-        """Dernière valeur filtrée."""
         return self._y
+
+
+# ──────────────────────────────────────────────
+# Motor command
+# ──────────────────────────────────────────────
+def apply_motors(bot: Rosmaster, base: float, diff: float) -> tuple[float, float, float, float]:
+    """
+    Compute and send the four motor commands.
+
+    Layout (Rosmaster X3) :
+        M1 = Front-Left   M2 = Rear-Left
+        M3 = Front-Right  M4 = Rear-Right
+
+    Differential drive :
+        left  = base + diff
+        right = base - diff
+
+    diff > 0  →  robot drifting right  →  left speeds up, right slows down
+    diff < 0  →  robot drifting left   →  right speeds up, left slows down
+
+    All values are clamped to [-100, 100] as required by set_motor().
+
+    Returns (fl, rl, fr, rr) as actually sent.
+    """
+    left  = max(-100.0, min(100.0, base + diff))
+    right = max(-100.0, min(100.0, base - diff))
+
+    fl, rl = left,  left    # Front-Left,  Rear-Left
+    fr, rr = right, right   # Front-Right, Rear-Right
+
+    bot.set_motor(fl, rl, fr, rr)
+    return fl, rl, fr, rr
+
+
+# ──────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────
+_running = True
+
+def _handle_signal(sig, frame):
+    global _running
+    _running = False
+
+
+def main():
+    global _running
+
+    parser = argparse.ArgumentParser(description="Straight-line PID controller — Yahboom Rosmaster")
+    parser.add_argument("--port",     type=str,   default="/dev/myserial", help="Serial port (default: /dev/myserial)")
+    parser.add_argument("--base",     type=float, default=75.0,            help="Forward speed 0-100 (default: 75)")
+    parser.add_argument("--duration", type=float, default=5.0,             help="Run duration in seconds (default: 5)")
+    parser.add_argument("--kp",       type=float, default=0.0)
+    parser.add_argument("--ki",       type=float, default=0.0)
+    parser.add_argument("--kd",       type=float, default=0.0)
+    args = parser.parse_args()
+
+    signal.signal(signal.SIGINT,  _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    DT = 0.02  # 50 Hz control loop
+
+    # ── Init robot ──────────────────────────────────────────────────────
+    print(f"[INFO] Port série : {args.port}")
+    bot = Rosmaster(car_type=1, com=args.port)
+    bot.create_receive_threading()
+    time.sleep(0.5)   # laisser l'IMU se stabiliser et le thread démarrer
+
+    pid  = PIDController(
+        kp=-args.kp, ki=-args.ki, kd=-args.kd,
+        output_limits=(-args.base, args.base),
+        integral_limits=(-15.0, 15.0),
+    )
+    filt = YawFilter(tau=0.08)
+
+    # ── Capture de la référence de cap ─────────────────────────────────
+    # get_imu_attitude_data() → (roll, pitch, yaw)  [index 0, 1, 2]
+    _, _, raw_ref = bot.get_imu_attitude_data(ToAngle=True)
+    yaw_ref = filt.update(raw_ref, dt=DT)
+    print(f"[INFO] Référence yaw : {yaw_ref:.2f}°")
+    print(f"[INFO] Durée : {args.duration:.1f}s  |  Base : {args.base}  |  PID kp={-args.kp} ki={-args.ki} kd={-args.kd}")
+
+    t_start = time.monotonic()
+    t_end   = t_start + args.duration
+    t_prev  = t_start
+
+    while _running:
+        now = time.monotonic()
+        if now >= t_end:
+            break
+
+        dt_real = max(now - t_prev, 1e-4)
+        t_prev  = now
+        elapsed = now - t_start
+
+        # ── Lecture yaw ────────────────────────────────────────────────
+        # get_imu_attitude_data retourne des degrés par défaut (ToAngle=True)
+        _, _, raw_yaw = bot.get_imu_attitude_data(ToAngle=True)
+        filtered_yaw  = filt.update(raw_yaw, dt=dt_real)
+
+        # ── Correction PID ─────────────────────────────────────────────
+        diff = pid.update(yaw_ref, filtered_yaw, dt=dt_real)
+
+        # ── Commande moteurs ───────────────────────────────────────────
+        fl, rl, fr, rr = apply_motors(bot, args.base, diff)
+
+        print(
+            f"t={elapsed:5.2f}s  yaw={filtered_yaw:7.2f}°"
+            f"  err={yaw_ref - filtered_yaw:+6.2f}°"
+            f"  diff={diff:+6.2f}"
+            f"  FL={fl:+5.1f}  RL={rl:+5.1f}  FR={fr:+5.1f}  RR={rr:+5.1f}"
+        )
+
+        # ── Timing ────────────────────────────────────────────────────
+        sleep_for = DT - (time.monotonic() - now)
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+    # ── Arrêt propre ───────────────────────────────────────────────────
+    apply_motors(bot, base=0.0, diff=0.0)
+    print("[INFO] Arrêt.")
+
+
+if __name__ == "__main__":
+    main()
