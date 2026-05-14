@@ -1,8 +1,20 @@
 import sys
+import os
 import signal
 import math
 import time
+import csv
 import argparse
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+    print("[WARN] matplotlib absent — pas de graphe généré")
 
 try:
     from Rosmaster_Lib import Rosmaster
@@ -120,6 +132,80 @@ def apply_motors(bot: Rosmaster, base: float, diff: float) -> tuple[float, float
 
 
 # ──────────────────────────────────────────────
+# Graph + CSV
+# ──────────────────────────────────────────────
+def _finalize(rows: list, args) -> None:
+    if not rows:
+        return
+
+    tag = f"kp{args.kp}_ki{args.ki}_kd{args.kd}"
+
+    # ── CSV ────────────────────────────────────
+    csv_name = f"run_{tag}.csv"
+    with open(csv_name, "w", newline="") as f:
+        f.write(f"# kp={args.kp}  ki={args.ki}  kd={args.kd}  base={args.base}\n")
+        w = csv.DictWriter(f, fieldnames=["time", "yaw", "err_deg", "diff", "fl", "rl", "fr", "rr"])
+        w.writeheader()
+        w.writerows(rows)
+    print(f"[CSV]  → {csv_name}")
+
+    # ── Stats ──────────────────────────────────
+    errors = [abs(r["err_deg"]) for r in rows]
+    n      = len(errors)
+    mae    = sum(errors) / n
+    rmse   = math.sqrt(sum(e * e for e in errors) / n)
+    maxe   = max(errors)
+    print(f"[STAT] MAE={mae:.3f}°  RMSE={rmse:.3f}°  MAX={maxe:.3f}°  n={n}")
+
+    # ── Plot ───────────────────────────────────
+    if not HAS_MPL:
+        return
+
+    png_name = f"run_{tag}.png"
+    t    = [r["time"]    for r in rows]
+    err  = [r["err_deg"] for r in rows]
+    diff = [r["diff"]    for r in rows]
+    fl   = [r["fl"]      for r in rows]
+    fr   = [r["fr"]      for r in rows]
+
+    fig = plt.figure(figsize=(12, 9))
+    fig.suptitle(
+        f"kp={args.kp}  ki={args.ki}  kd={args.kd}  base={args.base}",
+        fontsize=12, fontweight="bold"
+    )
+    gs = gridspec.GridSpec(3, 1, hspace=0.5)
+
+    ax1 = fig.add_subplot(gs[0])
+    ax1.plot(t, err, color="tab:blue", lw=1.5, label="erreur yaw (°)")
+    ax1.axhline(0, color="k", lw=0.8, ls="--")
+    ax1.set_ylabel("Erreur (°)")
+    ax1.set_title("Erreur yaw")
+    ax1.grid(alpha=0.35)
+    ax1.legend(loc="upper right", fontsize=8)
+
+    ax2 = fig.add_subplot(gs[1], sharex=ax1)
+    ax2.plot(t, diff, color="tab:orange", lw=1.5, label="diff (correction PID)")
+    ax2.axhline(0, color="k", lw=0.8, ls="--")
+    ax2.set_ylabel("Diff")
+    ax2.set_title("Correction différentielle")
+    ax2.grid(alpha=0.35)
+    ax2.legend(loc="upper right", fontsize=8)
+
+    ax3 = fig.add_subplot(gs[2], sharex=ax1)
+    ax3.plot(t, fl, color="tab:green", lw=1.5, label="FL / RL (gauche)")
+    ax3.plot(t, fr, color="tab:red",   lw=1.5, label="FR / RR (droite)", ls="--")
+    ax3.set_ylabel("Commande (0–100)")
+    ax3.set_xlabel("Temps (s)")
+    ax3.set_title("Commandes moteurs")
+    ax3.grid(alpha=0.35)
+    ax3.legend(loc="upper right", fontsize=8)
+
+    plt.savefig(png_name, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[PLOT] → {png_name}")
+
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 _running = True
@@ -144,7 +230,8 @@ def main():
     signal.signal(signal.SIGINT,  _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    DT = 0.02  # 50 Hz control loop
+    DT   = 0.02  # 50 Hz control loop
+    rows = []    # données pour CSV + graphe
 
     # ── Init robot ──────────────────────────────────────────────────────
     print(f"[INFO] Port série : {args.port}")
@@ -190,6 +277,14 @@ def main():
         # ── Commande moteurs ───────────────────────────────────────────
         fl, rl, fr, rr = apply_motors(bot, args.base, diff)
 
+        rows.append({
+            "time":    elapsed,
+            "yaw":     filtered_yaw,
+            "err_deg": yaw_ref - filtered_yaw,
+            "diff":    diff,
+            "fl": fl, "rl": rl, "fr": fr, "rr": rr,
+        })
+
         print(
             f"t={elapsed:5.2f}s  yaw={filtered_yaw:7.2f}°"
             f"  err={yaw_ref - filtered_yaw:+6.2f}°"
@@ -205,6 +300,7 @@ def main():
     # ── Arrêt propre ───────────────────────────────────────────────────
     apply_motors(bot, base=0.0, diff=0.0)
     print("[INFO] Arrêt.")
+    _finalize(rows, args)
 
 
 if __name__ == "__main__":
