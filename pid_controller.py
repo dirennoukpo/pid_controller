@@ -11,10 +11,10 @@ try:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
-    HAS_MPL = True
 except ImportError:
-    HAS_MPL = False
-    print("[WARN] matplotlib absent — pas de graphe généré")
+    print("[ERROR] matplotlib est requis pour générer le fichier .png")
+    print("        Installez-le avec : pip install matplotlib")
+    sys.exit(1)
 
 try:
     from Rosmaster_Lib import Rosmaster
@@ -158,9 +158,6 @@ def _finalize(rows: list, args) -> None:
     print(f"[STAT] MAE={mae:.3f}°  RMSE={rmse:.3f}°  MAX={maxe:.3f}°  n={n}")
 
     # ── Plot ───────────────────────────────────
-    if not HAS_MPL:
-        return
-
     png_name = f"run_{tag}.png"
     t    = [r["time"]    for r in rows]
     err  = [r["err_deg"] for r in rows]
@@ -220,11 +217,11 @@ def main():
 
     parser = argparse.ArgumentParser(description="Straight-line PID controller — Yahboom Rosmaster")
     parser.add_argument("--port",     type=str,   default="/dev/myserial", help="Serial port (default: /dev/myserial)")
-    parser.add_argument("--base",     type=float, default=75.0,            help="Forward speed 0-100 (default: 75)")
+    parser.add_argument("--base",     type=float, default=85.0,            help="Forward speed 0-100 (default: 75)")
     parser.add_argument("--duration", type=float, default=5.0,             help="Run duration in seconds (default: 5)")
-    parser.add_argument("--kp",       type=float, default=0.0)
-    parser.add_argument("--ki",       type=float, default=0.0)
-    parser.add_argument("--kd",       type=float, default=0.0)
+    parser.add_argument("--kp",       type=float, default=5.8)
+    parser.add_argument("--ki",       type=float, default=4.35)
+    parser.add_argument("--kd",       type=float, default=0.1005)
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT,  _handle_signal)
