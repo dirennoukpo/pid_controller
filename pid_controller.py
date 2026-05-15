@@ -284,14 +284,14 @@ def main():
     global _running
 
     parser = argparse.ArgumentParser(description="Straight-line PID controller — Yahboom Rosmaster")
-    parser.add_argument("--port",        type=str,   default="/dev/myserial", help="Serial port (default: /dev/myserial)")
+    parser.add_argument("--port",        type=str,   default="/dev/ttyUSB0", help="Serial port (default: /dev/ttyUSB0)")
     parser.add_argument("--base",        type=float, default=85.0,            help="Forward speed 0-100 (default: 85)")
     parser.add_argument("--duration",    type=float, default=5.0,             help="Run duration in seconds (default: 5)")
     parser.add_argument("--kp",          type=float, default=5.8)
     parser.add_argument("--ki",          type=float, default=4.35)
     parser.add_argument("--kd",          type=float, default=0.1005)
     parser.add_argument("--no-calib",    action="store_true",                 help="Désactiver la calibration encodeurs")
-    parser.add_argument("--calib-speed", type=float, default=60.0,            help="Vitesse de calibration 0-100 (default: 60)")
+    parser.add_argument("--calib-speed", type=float, default=100.0,            help="Vitesse de calibration 0-100 (default: 60)")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT,  _handle_signal)
@@ -311,7 +311,7 @@ def main():
         factors = (1.0, 1.0, 1.0, 1.0)
         print("[CAL]  Calibration désactivée — facteurs = 1.0 pour tous les moteurs")
     else:
-        factors = calibrate_motors(bot, calib_speed=args.calib_speed, duration=1.5)
+        factors = calibrate_motors(bot, calib_speed=args.calib_speed, duration=3.0)
         print("[CAL]  Attente 5 secondes avant le départ…")
         time.sleep(5.0)
 
