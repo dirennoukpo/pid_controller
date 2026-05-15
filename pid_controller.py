@@ -100,9 +100,73 @@ class YawFilter:
 
 
 # ──────────────────────────────────────────────
+# Auto-calibration par encodeurs
+# ──────────────────────────────────────────────
+def calibrate_motors(bot: Rosmaster, calib_speed: float = 60.0, duration: float = 1.5) -> tuple:
+    """
+    Fait tourner les 4 moteurs à la même consigne pendant `duration` secondes,
+    mesure les ticks d'encodeur produits par chacun, et calcule des facteurs
+    correctifs normalisés sur le moteur le plus rapide.
+
+    Layout Rosmaster X3 :
+        M1 = Front-Left   M2 = Rear-Left
+        M3 = Front-Right  M4 = Rear-Right
+
+    Retourne (f1, f2, f3, f4) où chaque facteur est dans ]0, 1].
+    Le moteur le plus rapide reçoit 1.0 ; les autres sont réduits en proportion.
+    """
+    print("[CAL]  Démarrage de la calibration encodeurs…")
+
+    # Lecture des encodeurs avant
+    e1_start, e2_start, e3_start, e4_start = bot.get_motor_encoder()
+
+    # Faire tourner tous les moteurs à la même vitesse
+    bot.set_motor(calib_speed, calib_speed, calib_speed, calib_speed)
+    time.sleep(duration)
+    bot.set_motor(0, 0, 0, 0)
+    time.sleep(0.2)  # laisser les moteurs s'arrêter
+
+    # Lecture des encodeurs après
+    e1_end, e2_end, e3_end, e4_end = bot.get_motor_encoder()
+
+    ticks = [
+        abs(e1_end - e1_start),
+        abs(e2_end - e2_start),
+        abs(e3_end - e3_start),
+        abs(e4_end - e4_start),
+    ]
+
+    names = ["M1(FL)", "M2(RL)", "M3(FR)", "M4(RR)"]
+    for n, t in zip(names, ticks):
+        print(f"[CAL]  {n} → {t} ticks")
+
+    max_ticks = max(ticks)
+    if max_ticks == 0:
+        print("[CAL]  AVERTISSEMENT : aucun tick lu — encodeurs non fonctionnels, facteurs = 1.0")
+        return 1.0, 1.0, 1.0, 1.0
+
+    factors = tuple(t / max_ticks for t in ticks)
+    for n, f in zip(names, factors):
+        print(f"[CAL]  {n} → facteur = {f:.4f}")
+
+    # Identifier le(s) moteur(s) problématiques (< 90 % du plus rapide)
+    threshold = 0.90
+    for n, f in zip(names, factors):
+        if f < threshold:
+            print(f"[CAL]  ⚠  {n} est significativement plus lent ({f:.1%}) — suspect mécanique")
+
+    return factors
+
+
+# ──────────────────────────────────────────────
 # Motor command
 # ──────────────────────────────────────────────
-def apply_motors(bot: Rosmaster, base: float, diff: float) -> tuple[float, float, float, float]:
+def apply_motors(
+    bot: Rosmaster,
+    base: float,
+    diff: float,
+    factors: tuple = (1.0, 1.0, 1.0, 1.0),
+) -> tuple:
     """
     Compute and send the four motor commands.
 
@@ -114,18 +178,20 @@ def apply_motors(bot: Rosmaster, base: float, diff: float) -> tuple[float, float
         left  = base + diff
         right = base - diff
 
-    diff > 0  →  robot drifting right  →  left speeds up, right slows down
-    diff < 0  →  robot drifting left   →  right speeds up, left slows down
-
-    All values are clamped to [-100, 100] as required by set_motor().
+    Les facteurs de calibration compensent les déséquilibres mécaniques
+    moteur par moteur, avant le clamping final.
 
     Returns (fl, rl, fr, rr) as actually sent.
     """
-    left  = max(-100.0, min(100.0, base + diff))
-    right = max(-100.0, min(100.0, base - diff))
+    f1, f2, f3, f4 = factors
 
-    fl, rl = left,  left    # Front-Left,  Rear-Left
-    fr, rr = right, right   # Front-Right, Rear-Right
+    left  = base + diff
+    right = base - diff
+
+    fl = max(-100.0, min(100.0, left  * f1))
+    rl = max(-100.0, min(100.0, left  * f2))
+    fr = max(-100.0, min(100.0, right * f3))
+    rr = max(-100.0, min(100.0, right * f4))
 
     bot.set_motor(fl, rl, fr, rr)
     return fl, rl, fr, rr
@@ -134,7 +200,7 @@ def apply_motors(bot: Rosmaster, base: float, diff: float) -> tuple[float, float
 # ──────────────────────────────────────────────
 # Graph + CSV
 # ──────────────────────────────────────────────
-def _finalize(rows: list, args) -> None:
+def _finalize(rows: list, args, factors: tuple) -> None:
     if not rows:
         return
 
@@ -144,6 +210,7 @@ def _finalize(rows: list, args) -> None:
     csv_name = f"run_{tag}.csv"
     with open(csv_name, "w", newline="") as f:
         f.write(f"# kp={args.kp}  ki={args.ki}  kd={args.kd}  base={args.base}\n")
+        f.write(f"# calib_factors  f1={factors[0]:.4f}  f2={factors[1]:.4f}  f3={factors[2]:.4f}  f4={factors[3]:.4f}\n")
         w = csv.DictWriter(f, fieldnames=["time", "yaw", "err_deg", "diff", "fl", "rl", "fr", "rr"])
         w.writeheader()
         w.writerows(rows)
@@ -167,8 +234,9 @@ def _finalize(rows: list, args) -> None:
 
     fig = plt.figure(figsize=(12, 9))
     fig.suptitle(
-        f"kp={args.kp}  ki={args.ki}  kd={args.kd}  base={args.base}",
-        fontsize=12, fontweight="bold"
+        f"kp={args.kp}  ki={args.ki}  kd={args.kd}  base={args.base}"
+        f"\ncalib: f1={factors[0]:.3f}  f2={factors[1]:.3f}  f3={factors[2]:.3f}  f4={factors[3]:.3f}",
+        fontsize=11, fontweight="bold"
     )
     gs = gridspec.GridSpec(3, 1, hspace=0.5)
 
@@ -216,25 +284,36 @@ def main():
     global _running
 
     parser = argparse.ArgumentParser(description="Straight-line PID controller — Yahboom Rosmaster")
-    parser.add_argument("--port",     type=str,   default="/dev/myserial", help="Serial port (default: /dev/myserial)")
-    parser.add_argument("--base",     type=float, default=85.0,            help="Forward speed 0-100 (default: 75)")
-    parser.add_argument("--duration", type=float, default=5.0,             help="Run duration in seconds (default: 5)")
-    parser.add_argument("--kp",       type=float, default=5.8)
-    parser.add_argument("--ki",       type=float, default=4.35)
-    parser.add_argument("--kd",       type=float, default=0.1005)
+    parser.add_argument("--port",        type=str,   default="/dev/myserial", help="Serial port (default: /dev/myserial)")
+    parser.add_argument("--base",        type=float, default=85.0,            help="Forward speed 0-100 (default: 85)")
+    parser.add_argument("--duration",    type=float, default=5.0,             help="Run duration in seconds (default: 5)")
+    parser.add_argument("--kp",          type=float, default=5.8)
+    parser.add_argument("--ki",          type=float, default=4.35)
+    parser.add_argument("--kd",          type=float, default=0.1005)
+    parser.add_argument("--no-calib",    action="store_true",                 help="Désactiver la calibration encodeurs")
+    parser.add_argument("--calib-speed", type=float, default=60.0,            help="Vitesse de calibration 0-100 (default: 60)")
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT,  _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
     DT   = 0.02  # 50 Hz control loop
-    rows = []    # données pour CSV + graphe
+    rows = []
 
     # ── Init robot ──────────────────────────────────────────────────────
     print(f"[INFO] Port série : {args.port}")
     bot = Rosmaster(car_type=1, com=args.port)
     bot.create_receive_threading()
-    time.sleep(0.5)   # laisser l'IMU se stabiliser et le thread démarrer
+    time.sleep(0.5)
+
+    # ── Calibration encodeurs ───────────────────────────────────────────
+    if args.no_calib:
+        factors = (1.0, 1.0, 1.0, 1.0)
+        print("[CAL]  Calibration désactivée — facteurs = 1.0 pour tous les moteurs")
+    else:
+        factors = calibrate_motors(bot, calib_speed=args.calib_speed, duration=1.5)
+        print("[CAL]  Attente 5 secondes avant le départ…")
+        time.sleep(5.0)
 
     pid  = PIDController(
         kp=-args.kp, ki=-args.ki, kd=-args.kd,
@@ -244,7 +323,6 @@ def main():
     filt = YawFilter(tau=0.08)
 
     # ── Capture de la référence de cap ─────────────────────────────────
-    # get_imu_attitude_data() → (roll, pitch, yaw)  [index 0, 1, 2]
     _, _, raw_ref = bot.get_imu_attitude_data(ToAngle=True)
     yaw_ref = filt.update(raw_ref, dt=DT)
     print(f"[INFO] Référence yaw : {yaw_ref:.2f}°")
@@ -263,16 +341,12 @@ def main():
         t_prev  = now
         elapsed = now - t_start
 
-        # ── Lecture yaw ────────────────────────────────────────────────
-        # get_imu_attitude_data retourne des degrés par défaut (ToAngle=True)
         _, _, raw_yaw = bot.get_imu_attitude_data(ToAngle=True)
         filtered_yaw  = filt.update(raw_yaw, dt=dt_real)
 
-        # ── Correction PID ─────────────────────────────────────────────
         diff = pid.update(yaw_ref, filtered_yaw, dt=dt_real)
 
-        # ── Commande moteurs ───────────────────────────────────────────
-        fl, rl, fr, rr = apply_motors(bot, args.base, diff)
+        fl, rl, fr, rr = apply_motors(bot, args.base, diff, factors)
 
         rows.append({
             "time":    elapsed,
@@ -289,15 +363,14 @@ def main():
             f"  FL={fl:+5.1f}  RL={rl:+5.1f}  FR={fr:+5.1f}  RR={rr:+5.1f}"
         )
 
-        # ── Timing ────────────────────────────────────────────────────
         sleep_for = DT - (time.monotonic() - now)
         if sleep_for > 0:
             time.sleep(sleep_for)
 
     # ── Arrêt propre ───────────────────────────────────────────────────
-    apply_motors(bot, base=0.0, diff=0.0)
+    apply_motors(bot, base=0.0, diff=0.0, factors=factors)
     print("[INFO] Arrêt.")
-    _finalize(rows, args)
+    _finalize(rows, args, factors)
 
 
 if __name__ == "__main__":
