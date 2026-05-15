@@ -63,7 +63,7 @@ Through iterations, inserting a tuned Derivative term profoundly stabilized osci
 
 ### Data Graphs Example
 Below is an example of the control outputs mapped against Yaw recovery:
-![Example Analysis Plot](data/run_kp30.0_ki0.0_kd1.2.png)
+![Example Analysis Plot](data/pid_analysis.png)
 
 ### Live Video Demonstrations
 
